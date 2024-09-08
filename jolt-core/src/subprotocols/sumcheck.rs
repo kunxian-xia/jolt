@@ -452,6 +452,55 @@ impl<F: JoltField> SumcheckInstanceProof<F> {
         (SumcheckInstanceProof::new(polys), r, evals)
     }
 
+    pub fn prove_quadratic(
+        claim: &F,
+        num_rounds: usize,
+        poly_A: &mut DensePolynomial<F>,
+        poly_B: &mut DensePolynomial<F>,
+        transcript: &mut ProofTranscript,
+    ) -> (Self, Vec<F>, Vec<F>) {
+        let mut r: Vec<F> = Vec::with_capacity(num_rounds);
+        let mut polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
+        let mut claim_per_round = *claim;
+        for i in 0..num_rounds {
+            let poly = {
+                let (eval_point_0, eval_point_2) =
+                    Self::compute_eval_points_spartan_quadratic(poly_A, &poly_B);
+
+                let evals = [eval_point_0, claim_per_round - eval_point_0, eval_point_2];
+                UniPoly::from_evals(&evals)
+            };
+
+            let compressed_poly = poly.compress();
+            // append the prover's message to the transcript
+            compressed_poly.append_to_transcript(transcript);
+
+            //derive the verifier's challenge for the next round
+            let r_i: F = transcript.challenge_scalar();
+
+            r.push(r_i);
+            polys.push(compressed_poly);
+
+            // Set up next round
+            claim_per_round = poly.evaluate(&r_i);
+
+            // bound all tables to the verifier's challenege
+            rayon::join(
+                || poly_A.bound_poly_var_top_zero_optimized(&r_i),
+                || poly_B.bound_poly_var_top_zero_optimized(&r_i),
+            );
+
+            if i == num_rounds - 1 {
+                assert_eq!(poly.evaluate(&r_i), poly_A[0] * poly_B[0]);
+            }
+        }
+
+        let evals = vec![poly_A[0], poly_B[0]];
+        // drop_in_background_thread(poly_B);
+
+        (SumcheckInstanceProof::new(polys), r, evals)
+    }
+
     #[inline]
     #[tracing::instrument(skip_all, name = "Sumcheck::compute_eval_points_spartan_quadratic")]
     pub fn compute_eval_points_spartan_quadratic(
@@ -462,6 +511,9 @@ impl<F: JoltField> SumcheckInstanceProof<F> {
         (0..len)
             .into_par_iter()
             .map(|i| {
+                // a(x) = (1-x)*a[0] + x*a[1]
+
+                // a(0) = a[0]
                 // eval 0: bound_func is A(low)
                 let eval_point_0 = if poly_B[i].is_zero() || poly_A[i].is_zero() {
                     F::zero()
@@ -469,6 +521,7 @@ impl<F: JoltField> SumcheckInstanceProof<F> {
                     poly_A[i] * poly_B[i]
                 };
 
+                // a(2) = -a[0] + 2*a[1]
                 // eval 2: bound_func is -A(low) + 2*A(high)
                 let poly_B_bound_point = poly_B[len + i] + poly_B[len + i] - poly_B[i];
                 let eval_point_2 = if poly_B_bound_point.is_zero() {
@@ -540,5 +593,58 @@ impl<F: JoltField> SumcheckInstanceProof<F> {
         }
 
         Ok((e, r))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::poly::dense_mlpoly::DensePolynomial;
+    use crate::subprotocols::sumcheck::SumcheckInstanceProof;
+    use crate::utils::transcript::ProofTranscript;
+    use ark_bn254::Fr;
+    use ark_std::rand::prelude::ThreadRng;
+    use rayon::iter::IndexedParallelIterator;
+    use rayon::iter::IntoParallelRefIterator;
+    use rayon::iter::ParallelIterator;
+
+    #[test]
+    fn test_prove_quadratic() {
+        let mut rng = ThreadRng::default();
+        for nv in 15..23 {
+            let mut poly_a = DensePolynomial::<Fr>::random(nv, &mut rng);
+            let mut poly_b = DensePolynomial::<Fr>::random(nv, &mut rng);
+            let mut transcript = ProofTranscript::new(b"bench_sumcheck");
+
+            let poly_a_clone = poly_a.clone();
+            let poly_b_clone = poly_b.clone();
+
+            let expected_sum = poly_a
+                .Z
+                .par_iter()
+                .zip(poly_b.Z.par_iter())
+                .map(|(a, b)| a * b)
+                .sum::<Fr>();
+
+            let (sumcheck_proof, r, evals) = SumcheckInstanceProof::<Fr>::prove_quadratic(
+                &expected_sum,
+                nv,
+                &mut poly_a,
+                &mut poly_b,
+                &mut transcript,
+            );
+
+            let eval_a = poly_a_clone.evaluate(&r);
+            let eval_b = poly_b_clone.evaluate(&r);
+
+            assert_eq!(evals[0], eval_a);
+            assert_eq!(evals[1], eval_b);
+
+            let mut transcript = ProofTranscript::new(b"bench_sumcheck");
+            let (expected_e, expected_r) = sumcheck_proof
+                .verify(expected_sum, nv, 2, &mut transcript)
+                .expect("verify sumcheck");
+            assert_eq!(eval_a * eval_b, expected_e);
+            assert_eq!(r, expected_r);
+        }
     }
 }
